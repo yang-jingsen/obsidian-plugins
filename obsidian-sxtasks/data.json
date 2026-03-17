@@ -1,0 +1,36 @@
+{
+  "triggerTokens": [
+    "@task",
+    "/task"
+  ],
+  "codeFontFamily": "\"Avenir Next Condensed\", \"IBM Plex Sans Condensed\", sans-serif",
+  "taskTextFontFamily": "\"Avenir Next\", \"IBM Plex Sans\", sans-serif",
+  "referenceFontFamily": "\"IBM Plex Sans\", sans-serif",
+  "doneTagStyle": "outlined",
+  "strikeThroughDone": false,
+  "dateDisplayFormat": "mm-dd",
+  "doneMarkerPreset": "none",
+  "doneMarkerCustom": "DONE",
+  "listDoneMarkerPosition": "marker-code-date",
+  "referenceDoneMarkerPosition": "marker-code-date",
+  "labelGapPx": 8,
+  "labelPaddingY": 2,
+  "labelPaddingX": 8,
+  "labelRadiusPx": 999,
+  "topLevelColors": [
+    "#D9485F",
+    "#D97706",
+    "#2F9E44",
+    "#0EA5A5",
+    "#2563EB",
+    "#7C3AED"
+  ],
+  "subtaskColors": [
+    "#F08C99",
+    "#F3A54A",
+    "#66C27A",
+    "#55C9C9",
+    "#5B8DEF",
+    "#A78BFA"
+  ]
+}

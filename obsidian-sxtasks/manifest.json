@@ -1,0 +1,9 @@
+{
+  "id": "sx-tasks",
+  "name": "SX Tasks",
+  "version": "0.0.1",
+  "minAppVersion": "1.5.0",
+  "description": "Single-note structured tasks with stable references and completion dates.",
+  "author": "Senxiu & Codex",
+  "isDesktopOnly": false
+}

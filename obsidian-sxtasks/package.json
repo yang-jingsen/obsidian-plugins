@@ -1,0 +1,19 @@
+{
+  "name": "obsidian-sxtasks",
+  "version": "0.0.1",
+  "private": true,
+  "description": "SX Tasks Obsidian plugin",
+  "main": "main.js",
+  "scripts": {
+    "build": "node esbuild.config.mjs production",
+    "dev": "node esbuild.config.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.10",
+    "builtin-modules": "^4.0.0",
+    "esbuild": "^0.25.0",
+    "obsidian": "^1.8.7",
+    "tslib": "^2.6.3",
+    "typescript": "^5.5.4"
+  }
+}

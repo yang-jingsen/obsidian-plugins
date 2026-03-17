@@ -1,0 +1,899 @@
+"use strict";
+var __defProp = Object.defineProperty;
+var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
+var __getOwnPropNames = Object.getOwnPropertyNames;
+var __hasOwnProp = Object.prototype.hasOwnProperty;
+var __export = (target, all) => {
+  for (var name in all)
+    __defProp(target, name, { get: all[name], enumerable: true });
+};
+var __copyProps = (to, from, except, desc) => {
+  if (from && typeof from === "object" || typeof from === "function") {
+    for (let key of __getOwnPropNames(from))
+      if (!__hasOwnProp.call(to, key) && key !== except)
+        __defProp(to, key, { get: () => from[key], enumerable: !(desc = __getOwnPropDesc(from, key)) || desc.enumerable });
+  }
+  return to;
+};
+var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: true }), mod);
+
+// src/main.ts
+var main_exports = {};
+__export(main_exports, {
+  default: () => SXTasksPlugin
+});
+module.exports = __toCommonJS(main_exports);
+var import_obsidian = require("obsidian");
+var REF_PATTERN = /\[sxref:([A-Za-z0-9_-]+)\]/g;
+var DATE_MARKER_PATTERN = /@(\d{4}-\d{2}-\d{2})/g;
+var SX_COMMENT_PATTERN = /<!--\s*sx:([\s\S]*?)-->\s*$/;
+var LIST_ITEM_PATTERN = /^(\s*)([-*+])\s+(.*)$/;
+var CHECKBOX_PREFIX_PATTERN = /^\[[ xX]\]\s+/;
+var DEFAULT_SETTINGS = {
+  triggerTokens: ["@task", "/task"],
+  codeFontFamily: '"Avenir Next Condensed", "IBM Plex Sans Condensed", sans-serif',
+  taskTextFontFamily: '"Avenir Next", "IBM Plex Sans", sans-serif',
+  referenceFontFamily: '"IBM Plex Sans", sans-serif',
+  doneTagStyle: "outlined",
+  strikeThroughDone: false,
+  dateDisplayFormat: "yyyy-mm-dd",
+  doneMarkerPreset: "none",
+  doneMarkerCustom: "DONE",
+  listDoneMarkerPosition: "marker-code-date",
+  referenceDoneMarkerPosition: "marker-code-date",
+  labelGapPx: 8,
+  labelPaddingY: 2,
+  labelPaddingX: 8,
+  labelRadiusPx: 999,
+  topLevelColors: ["#D9485F", "#D97706", "#2F9E44", "#0EA5A5", "#2563EB", "#7C3AED"],
+  subtaskColors: ["#F08C99", "#F3A54A", "#66C27A", "#55C9C9", "#5B8DEF", "#A78BFA"]
+};
+var SXTasksPlugin = class extends import_obsidian.Plugin {
+  constructor() {
+    super(...arguments);
+    this.settings = DEFAULT_SETTINGS;
+    this.refreshTimers = /* @__PURE__ */ new Map();
+  }
+  async onload() {
+    await this.loadSettings();
+    this.applySettings();
+    this.registerMarkdownPostProcessor(async (el, ctx) => {
+      await this.decorateTaskLists(el, ctx);
+      await this.renderReferenceTokens(el, ctx);
+    });
+    this.registerEvent(this.app.workspace.on("editor-change", (_editor, info) => {
+      const file = info.file;
+      if (file instanceof import_obsidian.TFile) {
+        this.scheduleRefresh(file);
+      }
+    }));
+    this.registerEvent(this.app.vault.on("modify", (file) => {
+      if (file instanceof import_obsidian.TFile) {
+        this.scheduleRefresh(file);
+      }
+    }));
+    this.registerEditorSuggest(new SXTaskEditorSuggest(this));
+    this.addSettingTab(new SXTasksSettingTab(this.app, this));
+    this.addCommand({
+      id: "mark-current-line-as-sx-task",
+      name: "Mark current line as SX task",
+      editorCallback: async (editor, view) => {
+        const file = view.file;
+        if (!file) {
+          new import_obsidian.Notice("No active note.");
+          return;
+        }
+        await this.ensureCurrentLineTask(editor, file);
+      }
+    });
+    this.addCommand({
+      id: "insert-sxtask-reference",
+      name: "Insert SX Task reference",
+      editorCallback: async (editor, view) => {
+        const file = view.file;
+        if (!file) {
+          new import_obsidian.Notice("No active note.");
+          return;
+        }
+        const index = await this.getTaskIndex(file);
+        if (index.tasks.length === 0) {
+          new import_obsidian.Notice("No SX task available in this note.");
+          return;
+        }
+        new SXTaskReferenceSuggestModal(this.app, createFlatReferences(index.tasks), (choice) => {
+          editor.replaceSelection(`[sxref:${choice.task.id}]`);
+        }).open();
+      }
+    });
+  }
+  onunload() {
+    document.body.removeClass("sx-tasks-plugin");
+    for (const timer of this.refreshTimers.values()) {
+      window.clearTimeout(timer);
+    }
+    this.refreshTimers.clear();
+  }
+  async ensureCurrentLineTask(editor, file) {
+    const cursor = editor.getCursor();
+    const lineText = editor.getLine(cursor.line);
+    if (!LIST_ITEM_PATTERN.test(lineText)) {
+      new import_obsidian.Notice("Current line is not a markdown list item.");
+      return;
+    }
+    const currentMeta = parseSXMeta(lineText);
+    if (currentMeta?.id) {
+      new import_obsidian.Notice("This line is already an SX task.");
+      return;
+    }
+    editor.setLine(cursor.line, upsertSXMeta(lineText, { id: createTaskId(), done: null }));
+    await this.syncEditorToFile(editor, file);
+    new import_obsidian.Notice("SX task metadata added to current line.");
+  }
+  async decorateTaskLists(el, ctx) {
+    const file = this.app.vault.getAbstractFileByPath(ctx.sourcePath);
+    if (!(file instanceof import_obsidian.TFile)) {
+      return;
+    }
+    const content = await this.app.vault.cachedRead(file);
+    const index = parseTaskIndex(content);
+    if (index.tasks.length === 0) {
+      return;
+    }
+    const sectionInfo = ctx.getSectionInfo(el);
+    if (!sectionInfo) {
+      return;
+    }
+    const sectionTasks = index.tasks.filter((task) => task.line >= sectionInfo.lineStart && task.line <= sectionInfo.lineEnd);
+    if (sectionTasks.length === 0) {
+      return;
+    }
+    const listItems = Array.from(el.querySelectorAll("li"));
+    let taskPointer = 0;
+    for (const listItem of listItems) {
+      const task = sectionTasks[taskPointer];
+      if (!task) {
+        break;
+      }
+      if (listItem.querySelector(":scope > .sx-task-prefix")) {
+        continue;
+      }
+      const prefix = document.createElement("span");
+      prefix.className = "sx-task-prefix";
+      applyTaskAccent(prefix, task, this.settings);
+      listItem.toggleClass("sx-task-top-level", task.level === 0);
+      listItem.toggleClass("sx-task-subtask", task.level === 1);
+      const doneParts = task.done ? createListDoneParts(task.done, this.settings) : null;
+      if (doneParts && this.settings.listDoneMarkerPosition === "before-code") {
+        prefix.appendChild(doneParts.container);
+      }
+      const codeBadge = prefix.createSpan({ cls: "sx-task-code", text: task.code });
+      codeBadge.setAttribute("data-level", String(task.level));
+      codeBadge.toggleClass("is-done", hasDoneDate(task.done));
+      if (doneParts && this.settings.listDoneMarkerPosition === "marker-code-date") {
+        if (doneParts.marker) {
+          prefix.insertBefore(doneParts.marker, codeBadge);
+        }
+        if (doneParts.date) {
+          prefix.appendChild(doneParts.date);
+        }
+      }
+      if (doneParts && this.settings.listDoneMarkerPosition === "after-code") {
+        prefix.appendChild(doneParts.container);
+      }
+      listItem.prepend(prefix);
+      const contentEl = ensureTaskContentSpan(listItem);
+      contentEl.toggleClass("is-done", hasDoneDate(task.done));
+      if (doneParts) {
+        listItem.addClass("is-done");
+      }
+      prefix.addEventListener("click", async () => {
+        await this.toggleTaskById(file, task.id, offsetForLine(content, task.line));
+      });
+      taskPointer += 1;
+    }
+  }
+  async renderReferenceTokens(el, ctx) {
+    const file = this.app.vault.getAbstractFileByPath(ctx.sourcePath);
+    if (!(file instanceof import_obsidian.TFile)) {
+      return;
+    }
+    const content = await this.app.vault.cachedRead(file);
+    const index = parseTaskIndex(content);
+    if (index.tasks.length === 0) {
+      return;
+    }
+    const sectionInfo = ctx.getSectionInfo(el);
+    const beforeOffset = sectionInfo ? offsetForLine(content, sectionInfo.lineStart) : content.length;
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    const nodes = [];
+    let currentNode = walker.nextNode();
+    while (currentNode) {
+      if (currentNode instanceof Text && currentNode.nodeValue?.includes("[sxref:")) {
+        nodes.push(currentNode);
+      }
+      currentNode = walker.nextNode();
+    }
+    for (const node of nodes) {
+      const text = node.nodeValue ?? "";
+      REF_PATTERN.lastIndex = 0;
+      let match;
+      let lastIndex = 0;
+      let replaced = false;
+      const fragment = document.createDocumentFragment();
+      while ((match = REF_PATTERN.exec(text)) !== null) {
+        replaced = true;
+        const [full, taskId] = match;
+        const before = text.slice(lastIndex, match.index);
+        if (before) {
+          fragment.append(before);
+        }
+        const task = index.byId.get(taskId);
+        if (task) {
+          fragment.append(this.createReferenceBadge({ task, beforeOffset }, file));
+        } else {
+          fragment.append(full);
+        }
+        lastIndex = match.index + full.length;
+      }
+      if (!replaced) {
+        continue;
+      }
+      const after = text.slice(lastIndex);
+      if (after) {
+        fragment.append(after);
+      }
+      node.parentNode?.replaceChild(fragment, node);
+    }
+  }
+  createReferenceBadge(reference, file) {
+    const badge = document.createElement("span");
+    badge.className = "sx-task-ref";
+    applyTaskAccent(badge, reference.task, this.settings);
+    const doneParts = reference.task.done ? createReferenceDoneParts(reference.task.done, this.settings) : null;
+    if (doneParts && this.settings.referenceDoneMarkerPosition === "before-code") {
+      badge.appendChild(doneParts.container);
+    }
+    const codeEl = badge.createSpan({ cls: "sx-task-ref-code", text: reference.task.code });
+    codeEl.toggleClass("is-done", hasDoneDate(reference.task.done));
+    if (doneParts && this.settings.referenceDoneMarkerPosition === "marker-code-date") {
+      if (doneParts.marker) {
+        badge.insertBefore(doneParts.marker, codeEl);
+      }
+      if (doneParts.date) {
+        badge.appendChild(doneParts.date);
+      }
+    }
+    if (doneParts && this.settings.referenceDoneMarkerPosition === "after-code") {
+      badge.appendChild(doneParts.container);
+    }
+    if (reference.task.parentText) {
+      badge.createEl("strong", { cls: "sx-task-ref-parent", text: reference.task.parentText });
+      badge.createSpan({ cls: "sx-task-ref-separator", text: ": " });
+    }
+    badge.createSpan({ cls: "sx-task-ref-text", text: reference.task.text });
+    this.syncReferenceBadgeState(badge, reference.task.done);
+    badge.addEventListener("click", async () => {
+      const nextDone = await this.toggleTaskById(file, reference.task.id, reference.beforeOffset);
+      this.syncReferenceBadgeState(badge, nextDone);
+    });
+    return badge;
+  }
+  async getTaskIndex(file) {
+    const content = await this.app.vault.cachedRead(file);
+    return parseTaskIndex(content);
+  }
+  async insertReferenceAt(editor, file, task, trigger) {
+    editor.replaceRange(`[sxref:${task.id}]`, trigger.start, trigger.end);
+    await this.syncEditorToFile(editor, file);
+  }
+  syncReferenceBadgeState(badge, done) {
+    const isDone = hasDoneDate(done);
+    badge.toggleClass("is-done", isDone);
+    badge.querySelector(".sx-task-ref-code")?.toggleClass("is-done", isDone);
+    badge.querySelectorAll(".sx-task-ref-date, .sx-task-ref-date-group, .sx-task-ref-date-marker").forEach((el) => el.remove());
+    const codeEl = badge.querySelector(".sx-task-ref-code");
+    if (isDone) {
+      const parts = createReferenceDoneParts(done, this.settings);
+      if (this.settings.referenceDoneMarkerPosition === "before-code") {
+        if (codeEl?.parentNode) {
+          codeEl.parentNode.insertBefore(parts.container, codeEl);
+        } else {
+          badge.prepend(parts.container);
+        }
+      } else if (this.settings.referenceDoneMarkerPosition === "after-code") {
+        if (codeEl?.nextSibling) {
+          badge.insertBefore(parts.container, codeEl.nextSibling);
+        } else {
+          badge.appendChild(parts.container);
+        }
+      } else {
+        if (parts.marker) {
+          if (codeEl?.parentNode) {
+            codeEl.parentNode.insertBefore(parts.marker, codeEl);
+          } else {
+            badge.prepend(parts.marker);
+          }
+        }
+        if (parts.date) {
+          if (codeEl?.nextSibling) {
+            badge.insertBefore(parts.date, codeEl.nextSibling);
+          } else {
+            badge.appendChild(parts.date);
+          }
+        }
+      }
+    }
+  }
+  async toggleTaskById(file, taskId, beforeOffset) {
+    const content = await this.app.vault.cachedRead(file);
+    const index = parseTaskIndex(content);
+    const task = index.byId.get(taskId);
+    if (!task) {
+      new import_obsidian.Notice("SX task not found.");
+      return null;
+    }
+    const nextDone = hasDoneDate(task.done) ? null : inferCompletionDate(content, beforeOffset);
+    const lines = content.replace(/\r/g, "").split("\n");
+    lines[task.line] = upsertSXMeta(lines[task.line], {
+      id: task.id,
+      done: nextDone
+    });
+    await this.app.vault.modify(file, lines.join("\n"));
+    return nextDone;
+  }
+  async syncEditorToFile(editor, file) {
+    await this.app.vault.modify(file, editor.getValue());
+  }
+  scheduleRefresh(file) {
+    const existing = this.refreshTimers.get(file.path);
+    if (existing !== void 0) {
+      window.clearTimeout(existing);
+    }
+    const timer = window.setTimeout(() => {
+      this.refreshTimers.delete(file.path);
+      this.rerenderMarkdownViews(file);
+    }, 80);
+    this.refreshTimers.set(file.path, timer);
+  }
+  rerenderMarkdownViews(file) {
+    for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
+      const view = leaf.view;
+      if (!(view instanceof import_obsidian.MarkdownView)) {
+        continue;
+      }
+      if (view.file?.path !== file.path) {
+        continue;
+      }
+      view.previewMode.rerender(true);
+    }
+  }
+  async loadSettings() {
+    const saved = await this.loadData();
+    this.settings = {
+      ...DEFAULT_SETTINGS,
+      ...saved,
+      triggerTokens: normalizeTriggerTokens(saved?.triggerTokens),
+      topLevelColors: normalizePalette(saved?.topLevelColors, DEFAULT_SETTINGS.topLevelColors),
+      subtaskColors: normalizePalette(saved?.subtaskColors, DEFAULT_SETTINGS.subtaskColors)
+    };
+  }
+  async saveSettings() {
+    await this.saveData(this.settings);
+    this.applySettings();
+  }
+  applySettings() {
+    document.body.addClass("sx-tasks-plugin");
+    document.body.toggleClass("sx-tasks-strike-through", this.settings.strikeThroughDone);
+    document.body.toggleClass("sx-tasks-done-tag-outlined", this.settings.doneTagStyle === "outlined");
+    document.body.style.setProperty("--sx-task-code-font", this.settings.codeFontFamily);
+    document.body.style.setProperty("--sx-task-text-font", this.settings.taskTextFontFamily);
+    document.body.style.setProperty("--sx-task-ref-font", this.settings.referenceFontFamily);
+    document.body.style.setProperty("--sx-task-gap", `${this.settings.labelGapPx}px`);
+    document.body.style.setProperty("--sx-task-label-pad-y", `${this.settings.labelPaddingY}px`);
+    document.body.style.setProperty("--sx-task-label-pad-x", `${this.settings.labelPaddingX}px`);
+    document.body.style.setProperty("--sx-task-label-radius", `${this.settings.labelRadiusPx}px`);
+  }
+};
+var SXTaskEditorSuggest = class extends import_obsidian.EditorSuggest {
+  constructor(plugin) {
+    super(plugin.app);
+    this.plugin = plugin;
+  }
+  async onTrigger(cursor, editor) {
+    const line = editor.getLine(cursor.line);
+    const beforeCursor = line.slice(0, cursor.ch);
+    const match = findTriggerMatch(beforeCursor, this.plugin.settings.triggerTokens);
+    if (!match) {
+      return null;
+    }
+    return {
+      start: { line: cursor.line, ch: match.start },
+      end: cursor,
+      query: match.query
+    };
+  }
+  async getSuggestions(context) {
+    const view = this.app.workspace.getActiveViewOfType(import_obsidian.MarkdownView);
+    const file = view?.file;
+    if (!file) {
+      return [];
+    }
+    const index = await this.plugin.getTaskIndex(file);
+    const query = context.query.trim().toLowerCase();
+    const choices = createFlatReferences(index.tasks);
+    if (!query) {
+      return choices;
+    }
+    return choices.filter((choice) => choice.searchText.includes(query));
+  }
+  renderSuggestion(choice, el) {
+    el.createDiv({ text: `${choice.task.code} ${referenceDisplayText(choice.task)}` });
+    const context = choice.task.headingPath.length > 0 ? choice.task.headingPath.join(" / ") : "Current note";
+    el.createEl("small", { text: context });
+  }
+  selectSuggestion(choice) {
+    const view = this.app.workspace.getActiveViewOfType(import_obsidian.MarkdownView);
+    const file = view?.file;
+    const editor = view?.editor;
+    const trigger = this.context;
+    if (!file || !editor || !trigger) {
+      return;
+    }
+    void this.plugin.insertReferenceAt(editor, file, choice.task, trigger);
+    this.close();
+  }
+};
+var SXTaskReferenceSuggestModal = class extends import_obsidian.SuggestModal {
+  constructor(app, choices, onChoose) {
+    super(app);
+    this.choices = choices;
+    this.onChoose = onChoose;
+    this.setPlaceholder("Select an SX task reference");
+  }
+  getSuggestions(query) {
+    const normalizedQuery = query.trim().toLowerCase();
+    if (!normalizedQuery) {
+      return this.choices;
+    }
+    return this.choices.filter((choice) => choice.searchText.includes(normalizedQuery));
+  }
+  renderSuggestion(choice, el) {
+    el.createDiv({ text: `${choice.task.code} ${referenceDisplayText(choice.task)}` });
+    const context = choice.task.headingPath.length > 0 ? choice.task.headingPath.join(" / ") : "Current note";
+    el.createEl("small", { text: context });
+  }
+  onChooseSuggestion(choice) {
+    this.onChoose(choice);
+  }
+};
+function parseTaskIndex(content) {
+  const lines = content.replace(/\r/g, "").split("\n");
+  const tasks = [];
+  const byId = /* @__PURE__ */ new Map();
+  const byLine = /* @__PURE__ */ new Map();
+  const headingStack = [];
+  const counters = [];
+  let currentTopLevelTask = null;
+  for (let lineNumber = 0; lineNumber < lines.length; lineNumber += 1) {
+    const line = lines[lineNumber];
+    const heading = parseHeading(line);
+    if (heading) {
+      headingStack[heading.level - 1] = heading.text;
+      headingStack.length = heading.level;
+      continue;
+    }
+    const meta = parseSXMeta(line);
+    if (!meta) {
+      continue;
+    }
+    const listItem = parseListItem(line);
+    if (!listItem) {
+      continue;
+    }
+    const level = indentLevelForListItem(listItem.indent);
+    counters[level] = (counters[level] ?? 0) + 1;
+    counters.length = level + 1;
+    if (level === 0) {
+      counters[1] = 0;
+    }
+    const code = level === 0 ? alphaCode(counters[0] - 1) : `${alphaCode(counters[0] - 1)}${counters[1]}`;
+    const task = {
+      id: meta.id,
+      text: listItem.text,
+      done: meta.done,
+      line: lineNumber,
+      level,
+      code,
+      headingPath: [...headingStack],
+      parentId: level === 1 ? currentTopLevelTask?.id ?? null : null,
+      parentText: level === 1 ? currentTopLevelTask?.text ?? null : null
+    };
+    if (level === 0) {
+      currentTopLevelTask = task;
+    }
+    tasks.push(task);
+    byId.set(task.id, task);
+    byLine.set(task.line, task);
+  }
+  return { tasks, byId, byLine };
+}
+var SXTasksSettingTab = class extends import_obsidian.PluginSettingTab {
+  constructor(app, plugin) {
+    super(app, plugin);
+    this.plugin = plugin;
+  }
+  display() {
+    const { containerEl } = this;
+    containerEl.empty();
+    new import_obsidian.Setting(containerEl).setName("Trigger tokens").setDesc("Comma-separated tokens that open task autocomplete in the editor.").addText(
+      (text) => text.setPlaceholder("@task, /task").setValue(this.plugin.settings.triggerTokens.join(", ")).onChange(async (value) => {
+        this.plugin.settings.triggerTokens = normalizeTriggerTokens(value.split(","));
+        await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName("Code font").setDesc("Font family for the colored task code labels.").addText(
+      (text) => text.setValue(this.plugin.settings.codeFontFamily).onChange(async (value) => {
+        this.plugin.settings.codeFontFamily = value || DEFAULT_SETTINGS.codeFontFamily;
+        await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName("Task text font").setDesc("Font family for task text in rendered lists.").addText(
+      (text) => text.setValue(this.plugin.settings.taskTextFontFamily).onChange(async (value) => {
+        this.plugin.settings.taskTextFontFamily = value || DEFAULT_SETTINGS.taskTextFontFamily;
+        await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName("Reference font").setDesc("Font family for inline task references.").addText(
+      (text) => text.setValue(this.plugin.settings.referenceFontFamily).onChange(async (value) => {
+        this.plugin.settings.referenceFontFamily = value || DEFAULT_SETTINGS.referenceFontFamily;
+        await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName("Done tag style").setDesc("Controls how the task code badge itself changes when a task is completed.").addDropdown(
+      (dropdown) => dropdown.addOption("outlined", "Outlined").addOption("filled", "Filled").setValue(this.plugin.settings.doneTagStyle).onChange(async (value) => {
+        this.plugin.settings.doneTagStyle = value;
+        await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName("Done strike-through").setDesc("Add strike-through to completed tasks and references.").addToggle(
+      (toggle) => toggle.setValue(this.plugin.settings.strikeThroughDone).onChange(async (value) => {
+        this.plugin.settings.strikeThroughDone = value;
+        await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName("Date display format").setDesc("Controls how completion dates are shown in the UI. Stored dates remain unchanged.").addDropdown(
+      (dropdown) => dropdown.addOption("yyyy-mm-dd", "YYYY-MM-DD").addOption("mm-dd", "MM-DD").setValue(this.plugin.settings.dateDisplayFormat).onChange(async (value) => {
+        this.plugin.settings.dateDisplayFormat = value;
+        await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName("List done label position").setDesc("Choose whether the completion marker and date appear before or after the task code in lists.").addDropdown(
+      (dropdown) => dropdown.addOption("before-code", "Before code").addOption("after-code", "After code").addOption("marker-code-date", "Emoji + code + date").setValue(this.plugin.settings.listDoneMarkerPosition).onChange(async (value) => {
+        this.plugin.settings.listDoneMarkerPosition = value;
+        await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName("Reference done label position").setDesc("Choose whether the completion marker and date appear before or after the task code in task references.").addDropdown(
+      (dropdown) => dropdown.addOption("before-code", "Before code").addOption("after-code", "After code").addOption("marker-code-date", "Emoji + code + date").setValue(this.plugin.settings.referenceDoneMarkerPosition).onChange(async (value) => {
+        this.plugin.settings.referenceDoneMarkerPosition = value;
+        await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName("Done marker style").setDesc("Choose how the completion marker is shown before the rendered date.").addDropdown(
+      (dropdown) => dropdown.addOption("emoji-check", "Emoji check (\u2705)").addOption("plain-check", "Plain check (\u2713)").addOption("none", "No marker").addOption("custom", "Custom").setValue(this.plugin.settings.doneMarkerPreset).onChange(async (value) => {
+        this.plugin.settings.doneMarkerPreset = value;
+        await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName("Custom done marker").setDesc("Used when done marker style is set to Custom. You can enter any text or emoji.").addText(
+      (text) => text.setPlaceholder("\u2705").setValue(this.plugin.settings.doneMarkerCustom).onChange(async (value) => {
+        this.plugin.settings.doneMarkerCustom = value;
+        await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName("Label gap").setDesc("Space between the colored label and task text.").addSlider(
+      (slider) => slider.setLimits(2, 20, 1).setValue(this.plugin.settings.labelGapPx).setDynamicTooltip().onChange(async (value) => {
+        this.plugin.settings.labelGapPx = value;
+        await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName("Label horizontal padding").setDesc("Internal horizontal padding for the code label.").addSlider(
+      (slider) => slider.setLimits(4, 16, 1).setValue(this.plugin.settings.labelPaddingX).setDynamicTooltip().onChange(async (value) => {
+        this.plugin.settings.labelPaddingX = value;
+        await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName("Label vertical padding").setDesc("Internal vertical padding for the code label.").addSlider(
+      (slider) => slider.setLimits(1, 8, 1).setValue(this.plugin.settings.labelPaddingY).setDynamicTooltip().onChange(async (value) => {
+        this.plugin.settings.labelPaddingY = value;
+        await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName("Label radius").setDesc("Roundness of the code label badge.").addSlider(
+      (slider) => slider.setLimits(4, 999, 1).setValue(this.plugin.settings.labelRadiusPx).setDynamicTooltip().onChange(async (value) => {
+        this.plugin.settings.labelRadiusPx = value;
+        await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName("Top-level colors").setDesc("Comma-separated palette for parent tasks.").addTextArea(
+      (text) => text.setValue(this.plugin.settings.topLevelColors.join(", ")).onChange(async (value) => {
+        this.plugin.settings.topLevelColors = normalizePalette(value.split(","), DEFAULT_SETTINGS.topLevelColors);
+        await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName("Subtask colors").setDesc("Comma-separated palette for child tasks.").addTextArea(
+      (text) => text.setValue(this.plugin.settings.subtaskColors.join(", ")).onChange(async (value) => {
+        this.plugin.settings.subtaskColors = normalizePalette(value.split(","), DEFAULT_SETTINGS.subtaskColors);
+        await this.plugin.saveSettings();
+      })
+    );
+  }
+};
+function parseHeading(line) {
+  const match = line.match(/^(#{1,6})\s+(.*)$/);
+  if (!match) {
+    return null;
+  }
+  return { level: match[1].length, text: match[2].trim() };
+}
+function parseListItem(line) {
+  const match = line.match(LIST_ITEM_PATTERN);
+  if (!match) {
+    return null;
+  }
+  const text = stripSXComment(match[3]).replace(CHECKBOX_PREFIX_PATTERN, "").trim();
+  return { indent: match[1].length, text };
+}
+function indentLevelForListItem(indentWidth) {
+  return indentWidth > 0 ? 1 : 0;
+}
+function parseSXMeta(line) {
+  const match = line.match(SX_COMMENT_PATTERN);
+  if (!match) {
+    return null;
+  }
+  const id = readMetaAttr(match[1], "id");
+  if (!id) {
+    return null;
+  }
+  return {
+    id,
+    done: readMetaAttr(match[1], "done")
+  };
+}
+function readMetaAttr(attrs, key) {
+  const pattern = new RegExp(`${key}=([^\\s]+)`);
+  const match = attrs.match(pattern);
+  return match ? match[1] : null;
+}
+function upsertSXMeta(line, meta) {
+  const base = stripSXComment(line).trimEnd();
+  const attrs = [`id=${meta.id}`];
+  if (meta.done) {
+    attrs.push(`done=${meta.done}`);
+  }
+  return `${base} <!-- sx:${attrs.join(" ")} -->`;
+}
+function stripSXComment(line) {
+  return line.replace(SX_COMMENT_PATTERN, "");
+}
+function createFlatReferences(tasks) {
+  return tasks.map((task) => ({
+    task,
+    searchText: `${task.code} ${task.text} ${task.parentText ?? ""} ${task.headingPath.join(" ")} ${task.done ?? ""}`.toLowerCase()
+  }));
+}
+function referenceDisplayText(task) {
+  return task.parentText ? `${task.parentText}: ${task.text}` : task.text;
+}
+function inferCompletionDate(content, beforeOffset) {
+  const prior = content.slice(0, beforeOffset);
+  const dateMarker = findLastDateMarker(prior);
+  if (dateMarker) {
+    return dateMarker;
+  }
+  const headingDate = findLastHeadingDate(prior);
+  if (headingDate) {
+    return headingDate;
+  }
+  return (0, import_obsidian.moment)().format("YYYY-MM-DD");
+}
+function formatDisplayDate(date, displayFormat) {
+  if (!date) {
+    return "";
+  }
+  const parsed = (0, import_obsidian.moment)(date, "YYYY-MM-DD", true);
+  if (!parsed.isValid()) {
+    return date;
+  }
+  return displayFormat === "mm-dd" ? parsed.format("MM-DD") : parsed.format("YYYY-MM-DD");
+}
+function hasDoneDate(date) {
+  return typeof date === "string" && date.trim().length > 0;
+}
+function createListDoneParts(date, settings) {
+  const container = createSpan({ cls: "sx-task-date-group" });
+  const markerText = resolveDoneMarker(settings);
+  const dateText = formatDisplayDate(date, settings.dateDisplayFormat);
+  let marker = null;
+  if (markerText) {
+    marker = createSpan({ cls: "sx-task-date-marker", text: markerText });
+    container.appendChild(marker);
+  }
+  let dateEl = null;
+  if (dateText) {
+    dateEl = createSpan({ cls: "sx-task-date", text: dateText });
+    container.appendChild(dateEl);
+  }
+  return { container, marker, date: dateEl };
+}
+function createReferenceDoneParts(date, settings) {
+  const container = createSpan({ cls: "sx-task-ref-date-group" });
+  const markerText = resolveDoneMarker(settings);
+  const dateText = formatDisplayDate(date, settings.dateDisplayFormat);
+  let marker = null;
+  if (markerText) {
+    marker = createSpan({ cls: "sx-task-ref-date-marker", text: markerText });
+    container.appendChild(marker);
+  }
+  let dateEl = null;
+  if (dateText) {
+    dateEl = createSpan({ cls: "sx-task-ref-date", text: dateText });
+    container.appendChild(dateEl);
+  }
+  return { container, marker, date: dateEl };
+}
+function resolveDoneMarker(settings) {
+  switch (settings.doneMarkerPreset) {
+    case "emoji-check":
+      return "\u2705";
+    case "plain-check":
+      return "\u2713";
+    case "none":
+      return "";
+    case "custom":
+      return settings.doneMarkerCustom.trim();
+    default:
+      return "\u2705";
+  }
+}
+function findLastDateMarker(content) {
+  let match;
+  let result = null;
+  DATE_MARKER_PATTERN.lastIndex = 0;
+  while ((match = DATE_MARKER_PATTERN.exec(content)) !== null) {
+    result = match[1];
+  }
+  return result;
+}
+function findLastHeadingDate(content) {
+  const lines = content.replace(/\r/g, "").split("\n");
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index].trim();
+    if (!line.startsWith("#")) {
+      continue;
+    }
+    const title = line.replace(/^#+\s*/, "").trim();
+    const parsed = (0, import_obsidian.moment)(title, [import_obsidian.moment.ISO_8601, "MMMM D, YYYY", "MMM D, YYYY"], true);
+    if (parsed.isValid()) {
+      return parsed.format("YYYY-MM-DD");
+    }
+  }
+  return null;
+}
+function alphaCode(index) {
+  let value = index;
+  let result = "";
+  do {
+    result = String.fromCharCode(65 + value % 26) + result;
+    value = Math.floor(value / 26) - 1;
+  } while (value >= 0);
+  return result;
+}
+function findTriggerMatch(text, triggerTokens) {
+  for (const token of triggerTokens) {
+    const escaped = escapeRegex(token);
+    const pattern = new RegExp(`(^|\\s)(${escaped})(?:\\s+([^\\n]*))?$`);
+    const match = text.match(pattern);
+    if (!match || match.index === void 0) {
+      continue;
+    }
+    const leadingWhitespaceLength = match[1]?.length ?? 0;
+    const tokenStart = match.index + leadingWhitespaceLength;
+    const query = match[3] ?? "";
+    return { start: tokenStart, query };
+  }
+  return null;
+}
+function escapeRegex(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+function applyTaskAccent(el, task, settings) {
+  const palette = task.level === 0 ? settings.topLevelColors : settings.subtaskColors;
+  const paletteIndex = Math.max(0, topLevelTaskIndex(task.code));
+  const accent = palette[paletteIndex % palette.length] ?? DEFAULT_SETTINGS.topLevelColors[0];
+  el.style.setProperty("--sx-task-accent", accent);
+}
+function topLevelTaskIndex(code) {
+  const letterPart = code.match(/^[A-Z]+/)?.[0] ?? "A";
+  let index = 0;
+  for (let i = 0; i < letterPart.length; i += 1) {
+    index = index * 26 + (letterPart.charCodeAt(i) - 64);
+  }
+  return index - 1;
+}
+function normalizeTriggerTokens(input) {
+  if (!Array.isArray(input)) {
+    if (typeof input === "string") {
+      return normalizeTriggerTokens(input.split(","));
+    }
+    return [...DEFAULT_SETTINGS.triggerTokens];
+  }
+  const normalized = input.map((item) => String(item).trim()).filter((item) => item.length > 0);
+  return normalized.length > 0 ? normalized : [...DEFAULT_SETTINGS.triggerTokens];
+}
+function normalizePalette(input, fallback) {
+  if (!Array.isArray(input)) {
+    if (typeof input === "string") {
+      return normalizePalette(input.split(","), fallback);
+    }
+    return [...fallback];
+  }
+  const normalized = input.map((item) => String(item).trim()).filter((item) => item.length > 0);
+  return normalized.length > 0 ? normalized : [...fallback];
+}
+function createTaskId() {
+  return `sx_${Math.random().toString(36).slice(2, 10)}`;
+}
+function offsetForLine(content, targetLine) {
+  if (targetLine <= 0) {
+    return 0;
+  }
+  let offset = 0;
+  let currentLine = 0;
+  while (currentLine < targetLine && offset < content.length) {
+    const nextBreak = content.indexOf("\n", offset);
+    if (nextBreak === -1) {
+      return content.length;
+    }
+    offset = nextBreak + 1;
+    currentLine += 1;
+  }
+  return offset;
+}
+function ensureTaskContentSpan(listItem) {
+  const existing = listItem.querySelector(":scope > .sx-task-content");
+  if (existing instanceof HTMLElement) {
+    return existing;
+  }
+  const content = document.createElement("span");
+  content.className = "sx-task-content";
+  const nodesToMove = [];
+  for (const node of Array.from(listItem.childNodes)) {
+    if (node instanceof HTMLElement) {
+      if (node.hasClass("sx-task-prefix") || node.hasClass("list-bullet") || node.hasClass("list-collapse-indicator")) {
+        continue;
+      }
+      if (node.tagName === "UL" || node.tagName === "OL") {
+        continue;
+      }
+      if (node.hasClass("sx-task-content")) {
+        return node;
+      }
+    }
+    nodesToMove.push(node);
+  }
+  if (nodesToMove.length === 0) {
+    return content;
+  }
+  const anchor = listItem.querySelector(":scope > .sx-task-prefix");
+  for (const node of nodesToMove) {
+    content.appendChild(node);
+  }
+  if (anchor?.nextSibling) {
+    listItem.insertBefore(content, anchor.nextSibling);
+  } else {
+    listItem.appendChild(content);
+  }
+  return content;
+}
