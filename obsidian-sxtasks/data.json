@@ -1,14 +1,10 @@
 {
-  "triggerTokens": [
-    "@task",
-    "/task"
-  ],
   "codeFontFamily": "\"Avenir Next Condensed\", \"IBM Plex Sans Condensed\", sans-serif",
   "taskTextFontFamily": "\"Avenir Next\", \"IBM Plex Sans\", sans-serif",
   "referenceFontFamily": "\"IBM Plex Sans\", sans-serif",
   "doneTagStyle": "outlined",
   "strikeThroughDone": false,
-  "dateDisplayFormat": "mm-dd",
+  "dateDisplayFormat": "MM-DD {cnwd}",
   "doneMarkerPreset": "none",
   "doneMarkerCustom": "DONE",
   "listDoneMarkerPosition": "marker-code-date",
@@ -32,5 +28,9 @@
     "#55C9C9",
     "#5B8DEF",
     "#A78BFA"
+  ],
+  "triggerTokens": [
+    "@task",
+    "/task"
   ]
 }

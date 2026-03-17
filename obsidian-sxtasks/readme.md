@@ -17,6 +17,7 @@ The plugin gives you:
 - same-note inline task references
 - completion from either the source list or a reference
 - automatic completion date inference from note context
+- command-based same-note reference insertion
 - configurable visual styling for task tags and references
 
 The Markdown file remains the source of truth.
@@ -167,24 +168,6 @@ Opens a picker of SX tasks in the current note and inserts:
 [sxref:<task-id>]
 ```
 
-### Editor autocomplete trigger
-
-Inside the editor, you can type trigger tokens such as:
-
-```text
-@task
-```
-
-or:
-
-```text
-/task
-```
-
-to search tasks from the current note and insert a reference.
-
-The trigger tokens are configurable in plugin settings.
-
 ## Typical Workflow
 
 ### 1. Create a source list
@@ -212,13 +195,9 @@ Repeat for any task or subtask that should participate in SX Tasks.
 
 Example:
 
-```md
-## 2026-03-17
-
-Today I finished @task update caption
-```
-
-After autocomplete insertion, this becomes:
+1. Run `Insert SX Task reference` from the command palette.
+2. Pick a task from the current note.
+3. The plugin inserts:
 
 ```md
 Today I finished [sxref:sx_...]
@@ -242,7 +221,7 @@ SX Tasks currently supports configurable appearance for:
 - task text font
 - reference font
 - completion strike-through
-- completion date display format
+- date display template
 - completion marker style
 - list completion label position
 - reference completion label position
@@ -257,6 +236,18 @@ Current default completed-tag behavior is:
 - no completion emoji marker by default
 - list completion layout: `emoji + code + date`
 - reference completion layout: `emoji + code + date`
+- default date template: `YYYY-MM-DD`
+
+Date templates use Moment-style formatting.
+
+Examples:
+
+- `YYYY-MM-DD`
+- `MM-DD`
+- `mm-dd` also works and will be normalized to month-day
+- `MM-DD ddd`
+- `MM-DD {cnw}` for Chinese single-character weekday
+- `MM-DD {cnwd}` for Chinese weekday with `周`
 
 This means completed items are primarily indicated by:
 

@@ -30,13 +30,12 @@ var SX_COMMENT_PATTERN = /<!--\s*sx:([\s\S]*?)-->\s*$/;
 var LIST_ITEM_PATTERN = /^(\s*)([-*+])\s+(.*)$/;
 var CHECKBOX_PREFIX_PATTERN = /^\[[ xX]\]\s+/;
 var DEFAULT_SETTINGS = {
-  triggerTokens: ["@task", "/task"],
   codeFontFamily: '"Avenir Next Condensed", "IBM Plex Sans Condensed", sans-serif',
   taskTextFontFamily: '"Avenir Next", "IBM Plex Sans", sans-serif',
   referenceFontFamily: '"IBM Plex Sans", sans-serif',
   doneTagStyle: "outlined",
   strikeThroughDone: false,
-  dateDisplayFormat: "yyyy-mm-dd",
+  dateDisplayFormat: "YYYY-MM-DD",
   doneMarkerPreset: "none",
   doneMarkerCustom: "DONE",
   listDoneMarkerPosition: "marker-code-date",
@@ -72,7 +71,6 @@ var SXTasksPlugin = class extends import_obsidian.Plugin {
         this.scheduleRefresh(file);
       }
     }));
-    this.registerEditorSuggest(new SXTaskEditorSuggest(this));
     this.addSettingTab(new SXTasksSettingTab(this.app, this));
     this.addCommand({
       id: "mark-current-line-as-sx-task",
@@ -282,10 +280,6 @@ var SXTasksPlugin = class extends import_obsidian.Plugin {
     const content = await this.app.vault.cachedRead(file);
     return parseTaskIndex(content);
   }
-  async insertReferenceAt(editor, file, task, trigger) {
-    editor.replaceRange(`[sxref:${task.id}]`, trigger.start, trigger.end);
-    await this.syncEditorToFile(editor, file);
-  }
   syncReferenceBadgeState(badge, done) {
     const isDone = hasDoneDate(done);
     badge.toggleClass("is-done", isDone);
@@ -372,7 +366,7 @@ var SXTasksPlugin = class extends import_obsidian.Plugin {
     this.settings = {
       ...DEFAULT_SETTINGS,
       ...saved,
-      triggerTokens: normalizeTriggerTokens(saved?.triggerTokens),
+      dateDisplayFormat: normalizeDateDisplayTemplate(saved?.dateDisplayFormat ?? DEFAULT_SETTINGS.dateDisplayFormat),
       topLevelColors: normalizePalette(saved?.topLevelColors, DEFAULT_SETTINGS.topLevelColors),
       subtaskColors: normalizePalette(saved?.subtaskColors, DEFAULT_SETTINGS.subtaskColors)
     };
@@ -392,55 +386,6 @@ var SXTasksPlugin = class extends import_obsidian.Plugin {
     document.body.style.setProperty("--sx-task-label-pad-y", `${this.settings.labelPaddingY}px`);
     document.body.style.setProperty("--sx-task-label-pad-x", `${this.settings.labelPaddingX}px`);
     document.body.style.setProperty("--sx-task-label-radius", `${this.settings.labelRadiusPx}px`);
-  }
-};
-var SXTaskEditorSuggest = class extends import_obsidian.EditorSuggest {
-  constructor(plugin) {
-    super(plugin.app);
-    this.plugin = plugin;
-  }
-  async onTrigger(cursor, editor) {
-    const line = editor.getLine(cursor.line);
-    const beforeCursor = line.slice(0, cursor.ch);
-    const match = findTriggerMatch(beforeCursor, this.plugin.settings.triggerTokens);
-    if (!match) {
-      return null;
-    }
-    return {
-      start: { line: cursor.line, ch: match.start },
-      end: cursor,
-      query: match.query
-    };
-  }
-  async getSuggestions(context) {
-    const view = this.app.workspace.getActiveViewOfType(import_obsidian.MarkdownView);
-    const file = view?.file;
-    if (!file) {
-      return [];
-    }
-    const index = await this.plugin.getTaskIndex(file);
-    const query = context.query.trim().toLowerCase();
-    const choices = createFlatReferences(index.tasks);
-    if (!query) {
-      return choices;
-    }
-    return choices.filter((choice) => choice.searchText.includes(query));
-  }
-  renderSuggestion(choice, el) {
-    el.createDiv({ text: `${choice.task.code} ${referenceDisplayText(choice.task)}` });
-    const context = choice.task.headingPath.length > 0 ? choice.task.headingPath.join(" / ") : "Current note";
-    el.createEl("small", { text: context });
-  }
-  selectSuggestion(choice) {
-    const view = this.app.workspace.getActiveViewOfType(import_obsidian.MarkdownView);
-    const file = view?.file;
-    const editor = view?.editor;
-    const trigger = this.context;
-    if (!file || !editor || !trigger) {
-      return;
-    }
-    void this.plugin.insertReferenceAt(editor, file, choice.task, trigger);
-    this.close();
   }
 };
 var SXTaskReferenceSuggestModal = class extends import_obsidian.SuggestModal {
@@ -525,12 +470,6 @@ var SXTasksSettingTab = class extends import_obsidian.PluginSettingTab {
   display() {
     const { containerEl } = this;
     containerEl.empty();
-    new import_obsidian.Setting(containerEl).setName("Trigger tokens").setDesc("Comma-separated tokens that open task autocomplete in the editor.").addText(
-      (text) => text.setPlaceholder("@task, /task").setValue(this.plugin.settings.triggerTokens.join(", ")).onChange(async (value) => {
-        this.plugin.settings.triggerTokens = normalizeTriggerTokens(value.split(","));
-        await this.plugin.saveSettings();
-      })
-    );
     new import_obsidian.Setting(containerEl).setName("Code font").setDesc("Font family for the colored task code labels.").addText(
       (text) => text.setValue(this.plugin.settings.codeFontFamily).onChange(async (value) => {
         this.plugin.settings.codeFontFamily = value || DEFAULT_SETTINGS.codeFontFamily;
@@ -561,9 +500,9 @@ var SXTasksSettingTab = class extends import_obsidian.PluginSettingTab {
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Date display format").setDesc("Controls how completion dates are shown in the UI. Stored dates remain unchanged.").addDropdown(
-      (dropdown) => dropdown.addOption("yyyy-mm-dd", "YYYY-MM-DD").addOption("mm-dd", "MM-DD").setValue(this.plugin.settings.dateDisplayFormat).onChange(async (value) => {
-        this.plugin.settings.dateDisplayFormat = value;
+    new import_obsidian.Setting(containerEl).setName("Date display template").setDesc("Moment-style format string for rendered dates. You can also use {cnw} for Chinese weekday single character and {cnwd} for Chinese weekday with \u5468.").addText(
+      (text) => text.setPlaceholder("MM-DD {cnw}").setValue(this.plugin.settings.dateDisplayFormat).onChange(async (value) => {
+        this.plugin.settings.dateDisplayFormat = value || DEFAULT_SETTINGS.dateDisplayFormat;
         await this.plugin.saveSettings();
       })
     );
@@ -706,7 +645,8 @@ function formatDisplayDate(date, displayFormat) {
   if (!parsed.isValid()) {
     return date;
   }
-  return displayFormat === "mm-dd" ? parsed.format("MM-DD") : parsed.format("YYYY-MM-DD");
+  const template = normalizeDateDisplayTemplate(displayFormat.trim() || DEFAULT_SETTINGS.dateDisplayFormat);
+  return applyDateTemplate(parsed, template);
 }
 function hasDoneDate(date) {
   return typeof date === "string" && date.trim().length > 0;
@@ -742,6 +682,15 @@ function createReferenceDoneParts(date, settings) {
     container.appendChild(dateEl);
   }
   return { container, marker, date: dateEl };
+}
+function normalizeDateDisplayTemplate(template) {
+  return template.replace(/yyyy/g, "YYYY").replace(/yy/g, "YY").replace(/(?<!H|h):mm/g, (m) => m).replace(/mm/g, "MM").replace(/(^|[^A-Za-z])mm(?=[^A-Za-z]|$)/g, (m, p1) => `${p1}MM`).replace(/dd/g, "DD").replace(/(^|[^A-Za-z])dd(?=[^A-Za-z]|$)/g, (m, p1) => `${p1}DD`);
+}
+function applyDateTemplate(parsed, template) {
+  const cnWeekdays = ["\u65E5", "\u4E00", "\u4E8C", "\u4E09", "\u56DB", "\u4E94", "\u516D"];
+  const weekday = cnWeekdays[parsed.day()];
+  const protectedTemplate = template.replace(/\{cnwd\}/g, "[__sx_cnwd__]").replace(/\{cnw\}/g, "[__sx_cnw__]");
+  return parsed.format(protectedTemplate).replace(/__sx_cnwd__/g, `\u5468${weekday}`).replace(/__sx_cnw__/g, weekday);
 }
 function resolveDoneMarker(settings) {
   switch (settings.doneMarkerPreset) {
@@ -790,24 +739,6 @@ function alphaCode(index) {
   } while (value >= 0);
   return result;
 }
-function findTriggerMatch(text, triggerTokens) {
-  for (const token of triggerTokens) {
-    const escaped = escapeRegex(token);
-    const pattern = new RegExp(`(^|\\s)(${escaped})(?:\\s+([^\\n]*))?$`);
-    const match = text.match(pattern);
-    if (!match || match.index === void 0) {
-      continue;
-    }
-    const leadingWhitespaceLength = match[1]?.length ?? 0;
-    const tokenStart = match.index + leadingWhitespaceLength;
-    const query = match[3] ?? "";
-    return { start: tokenStart, query };
-  }
-  return null;
-}
-function escapeRegex(value) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
 function applyTaskAccent(el, task, settings) {
   const palette = task.level === 0 ? settings.topLevelColors : settings.subtaskColors;
   const paletteIndex = Math.max(0, topLevelTaskIndex(task.code));
@@ -821,16 +752,6 @@ function topLevelTaskIndex(code) {
     index = index * 26 + (letterPart.charCodeAt(i) - 64);
   }
   return index - 1;
-}
-function normalizeTriggerTokens(input) {
-  if (!Array.isArray(input)) {
-    if (typeof input === "string") {
-      return normalizeTriggerTokens(input.split(","));
-    }
-    return [...DEFAULT_SETTINGS.triggerTokens];
-  }
-  const normalized = input.map((item) => String(item).trim()).filter((item) => item.length > 0);
-  return normalized.length > 0 ? normalized : [...DEFAULT_SETTINGS.triggerTokens];
 }
 function normalizePalette(input, fallback) {
   if (!Array.isArray(input)) {

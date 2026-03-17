@@ -1,8 +1,5 @@
 import {
 	Editor,
-	EditorPosition,
-	EditorSuggest,
-	EditorSuggestContext,
 	MarkdownPostProcessorContext,
 	MarkdownView,
 	Notice,
@@ -48,13 +45,12 @@ type TaskIndex = {
 };
 
 type SXTasksSettings = {
-	triggerTokens: string[];
 	codeFontFamily: string;
 	taskTextFontFamily: string;
 	referenceFontFamily: string;
 	doneTagStyle: "filled" | "outlined";
 	strikeThroughDone: boolean;
-	dateDisplayFormat: "yyyy-mm-dd" | "mm-dd";
+	dateDisplayFormat: string;
 	doneMarkerPreset: "emoji-check" | "plain-check" | "none" | "custom";
 	doneMarkerCustom: string;
 	listDoneMarkerPosition: "before-code" | "after-code" | "marker-code-date";
@@ -74,13 +70,12 @@ const LIST_ITEM_PATTERN = /^(\s*)([-*+])\s+(.*)$/;
 const CHECKBOX_PREFIX_PATTERN = /^\[[ xX]\]\s+/;
 
 const DEFAULT_SETTINGS: SXTasksSettings = {
-	triggerTokens: ["@task", "/task"],
 	codeFontFamily: "\"Avenir Next Condensed\", \"IBM Plex Sans Condensed\", sans-serif",
 	taskTextFontFamily: "\"Avenir Next\", \"IBM Plex Sans\", sans-serif",
 	referenceFontFamily: "\"IBM Plex Sans\", sans-serif",
 	doneTagStyle: "outlined",
 	strikeThroughDone: false,
-	dateDisplayFormat: "yyyy-mm-dd",
+	dateDisplayFormat: "YYYY-MM-DD",
 	doneMarkerPreset: "none",
 	doneMarkerCustom: "DONE",
 	listDoneMarkerPosition: "marker-code-date",
@@ -119,7 +114,6 @@ export default class SXTasksPlugin extends Plugin {
 			}
 		}));
 
-		this.registerEditorSuggest(new SXTaskEditorSuggest(this));
 		this.addSettingTab(new SXTasksSettingTab(this.app, this));
 
 		this.addCommand({
@@ -358,10 +352,6 @@ export default class SXTasksPlugin extends Plugin {
 		return parseTaskIndex(content);
 	}
 
-	async insertReferenceAt(editor: Editor, file: TFile, task: SXTaskItem, trigger: EditorSuggestContext): Promise<void> {
-		editor.replaceRange(`[sxref:${task.id}]`, trigger.start, trigger.end);
-		await this.syncEditorToFile(editor, file);
-	}
 
 	private syncReferenceBadgeState(badge: HTMLElement, done: string | null): void {
 		const isDone = hasDoneDate(done);
@@ -457,7 +447,7 @@ export default class SXTasksPlugin extends Plugin {
 		this.settings = {
 			...DEFAULT_SETTINGS,
 			...saved,
-			triggerTokens: normalizeTriggerTokens(saved?.triggerTokens),
+			dateDisplayFormat: normalizeDateDisplayTemplate(saved?.dateDisplayFormat ?? DEFAULT_SETTINGS.dateDisplayFormat),
 			topLevelColors: normalizePalette(saved?.topLevelColors, DEFAULT_SETTINGS.topLevelColors),
 			subtaskColors: normalizePalette(saved?.subtaskColors, DEFAULT_SETTINGS.subtaskColors)
 		};
@@ -479,65 +469,6 @@ export default class SXTasksPlugin extends Plugin {
 		document.body.style.setProperty("--sx-task-label-pad-y", `${this.settings.labelPaddingY}px`);
 		document.body.style.setProperty("--sx-task-label-pad-x", `${this.settings.labelPaddingX}px`);
 		document.body.style.setProperty("--sx-task-label-radius", `${this.settings.labelRadiusPx}px`);
-	}
-}
-
-class SXTaskEditorSuggest extends EditorSuggest<FlatTaskReference> {
-	private readonly plugin: SXTasksPlugin;
-
-	constructor(plugin: SXTasksPlugin) {
-		super(plugin.app);
-		this.plugin = plugin;
-	}
-
-	async onTrigger(cursor: EditorPosition, editor: Editor): Promise<EditorSuggestContext | null> {
-		const line = editor.getLine(cursor.line);
-		const beforeCursor = line.slice(0, cursor.ch);
-		const match = findTriggerMatch(beforeCursor, this.plugin.settings.triggerTokens);
-		if (!match) {
-			return null;
-		}
-
-		return {
-			start: { line: cursor.line, ch: match.start },
-			end: cursor,
-			query: match.query
-		};
-	}
-
-	async getSuggestions(context: EditorSuggestContext): Promise<FlatTaskReference[]> {
-		const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-		const file = view?.file;
-		if (!file) {
-			return [];
-		}
-
-		const index = await this.plugin.getTaskIndex(file);
-		const query = context.query.trim().toLowerCase();
-		const choices = createFlatReferences(index.tasks);
-		if (!query) {
-			return choices;
-		}
-		return choices.filter((choice) => choice.searchText.includes(query));
-	}
-
-	renderSuggestion(choice: FlatTaskReference, el: HTMLElement): void {
-		el.createDiv({ text: `${choice.task.code} ${referenceDisplayText(choice.task)}` });
-		const context = choice.task.headingPath.length > 0 ? choice.task.headingPath.join(" / ") : "Current note";
-		el.createEl("small", { text: context });
-	}
-
-	selectSuggestion(choice: FlatTaskReference): void {
-		const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-		const file = view?.file;
-		const editor = view?.editor;
-		const trigger = this.context;
-		if (!file || !editor || !trigger) {
-			return;
-		}
-
-		void this.plugin.insertReferenceAt(editor, file, choice.task, trigger);
-		this.close();
 	}
 }
 
@@ -641,18 +572,6 @@ class SXTasksSettingTab extends PluginSettingTab {
 		const { containerEl } = this;
 		containerEl.empty();
 
-		new Setting(containerEl)
-			.setName("Trigger tokens")
-			.setDesc("Comma-separated tokens that open task autocomplete in the editor.")
-			.addText((text) =>
-				text
-					.setPlaceholder("@task, /task")
-					.setValue(this.plugin.settings.triggerTokens.join(", "))
-					.onChange(async (value) => {
-						this.plugin.settings.triggerTokens = normalizeTriggerTokens(value.split(","));
-						await this.plugin.saveSettings();
-					})
-			);
 
 		new Setting(containerEl)
 			.setName("Code font")
@@ -709,15 +628,14 @@ class SXTasksSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
-			.setName("Date display format")
-			.setDesc("Controls how completion dates are shown in the UI. Stored dates remain unchanged.")
-			.addDropdown((dropdown) =>
-				dropdown
-					.addOption("yyyy-mm-dd", "YYYY-MM-DD")
-					.addOption("mm-dd", "MM-DD")
+			.setName("Date display template")
+			.setDesc("Moment-style format string for rendered dates. You can also use {cnw} for Chinese weekday single character and {cnwd} for Chinese weekday with 周.")
+			.addText((text) =>
+				text
+					.setPlaceholder("MM-DD {cnw}")
 					.setValue(this.plugin.settings.dateDisplayFormat)
-					.onChange(async (value: "yyyy-mm-dd" | "mm-dd") => {
-						this.plugin.settings.dateDisplayFormat = value;
+					.onChange(async (value) => {
+						this.plugin.settings.dateDisplayFormat = value || DEFAULT_SETTINGS.dateDisplayFormat;
 						await this.plugin.saveSettings();
 					})
 			);
@@ -927,7 +845,7 @@ function inferCompletionDate(content: string, beforeOffset: number): string {
 	return moment().format("YYYY-MM-DD");
 }
 
-function formatDisplayDate(date: string | null, displayFormat: SXTasksSettings["dateDisplayFormat"]): string {
+function formatDisplayDate(date: string | null, displayFormat: string): string {
 	if (!date) {
 		return "";
 	}
@@ -937,7 +855,8 @@ function formatDisplayDate(date: string | null, displayFormat: SXTasksSettings["
 		return date;
 	}
 
-	return displayFormat === "mm-dd" ? parsed.format("MM-DD") : parsed.format("YYYY-MM-DD");
+	const template = normalizeDateDisplayTemplate(displayFormat.trim() || DEFAULT_SETTINGS.dateDisplayFormat);
+	return applyDateTemplate(parsed, template);
 }
 
 function hasDoneDate(date: string | null): boolean {
@@ -1002,6 +921,29 @@ function createReferenceDoneParts(date: string, settings: SXTasksSettings): {
 	return { container, marker, date: dateEl };
 }
 
+function normalizeDateDisplayTemplate(template: string): string {
+	return template
+		.replace(/yyyy/g, "YYYY")
+		.replace(/yy/g, "YY")
+		.replace(/(?<!H|h):mm/g, (m) => m)
+		.replace(/mm/g, "MM")
+		.replace(/(^|[^A-Za-z])mm(?=[^A-Za-z]|$)/g, (m, p1) => `${p1}MM`)
+		.replace(/dd/g, "DD")
+		.replace(/(^|[^A-Za-z])dd(?=[^A-Za-z]|$)/g, (m, p1) => `${p1}DD`);
+}
+
+function applyDateTemplate(parsed: ReturnType<typeof moment>, template: string): string {
+	const cnWeekdays = ["日", "一", "二", "三", "四", "五", "六"];
+	const weekday = cnWeekdays[parsed.day()];
+	const protectedTemplate = template
+		.replace(/\{cnwd\}/g, "[__sx_cnwd__]")
+		.replace(/\{cnw\}/g, "[__sx_cnw__]");
+
+	return parsed.format(protectedTemplate)
+		.replace(/__sx_cnwd__/g, `周${weekday}`)
+		.replace(/__sx_cnw__/g, weekday);
+}
+
 function resolveDoneMarker(settings: SXTasksSettings): string {
 	switch (settings.doneMarkerPreset) {
 		case "emoji-check":
@@ -1059,27 +1001,6 @@ function alphaCode(index: number): string {
 	return result;
 }
 
-function findTriggerMatch(text: string, triggerTokens: string[]): { start: number; query: string } | null {
-	for (const token of triggerTokens) {
-		const escaped = escapeRegex(token);
-		const pattern = new RegExp(`(^|\\s)(${escaped})(?:\\s+([^\\n]*))?$`);
-		const match = text.match(pattern);
-		if (!match || match.index === undefined) {
-			continue;
-		}
-
-		const leadingWhitespaceLength = match[1]?.length ?? 0;
-		const tokenStart = match.index + leadingWhitespaceLength;
-		const query = match[3] ?? "";
-		return { start: tokenStart, query };
-	}
-
-	return null;
-}
-
-function escapeRegex(value: string): string {
-	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
 
 function applyTaskAccent(el: HTMLElement, task: SXTaskItem, settings: SXTasksSettings): void {
 	const palette = task.level === 0 ? settings.topLevelColors : settings.subtaskColors;
@@ -1097,19 +1018,6 @@ function topLevelTaskIndex(code: string): number {
 	return index - 1;
 }
 
-function normalizeTriggerTokens(input: unknown): string[] {
-	if (!Array.isArray(input)) {
-		if (typeof input === "string") {
-			return normalizeTriggerTokens(input.split(","));
-		}
-		return [...DEFAULT_SETTINGS.triggerTokens];
-	}
-
-	const normalized = input
-		.map((item) => String(item).trim())
-		.filter((item) => item.length > 0);
-	return normalized.length > 0 ? normalized : [...DEFAULT_SETTINGS.triggerTokens];
-}
 
 function normalizePalette(input: unknown, fallback: string[]): string[] {
 	if (!Array.isArray(input)) {
